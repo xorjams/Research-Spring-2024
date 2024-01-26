@@ -1,0 +1,445 @@
+import numpy as np
+from scipy import linalg
+import scipy.sparse as sp
+import matplotlib.pyplot as plt
+from scipy import sparse
+from scipy.sparse import csr_matrix
+import random
+import math
+import csv
+import argparse
+import copy
+from decimal import *
+
+default = 1
+parser = argparse.ArgumentParser(description = 'Parameters of Spin Fermion Model')
+
+
+parser.add_argument('-c','--Coupling', type = float, help = 'spin-spin coupling')
+parser.add_argument('-d','--Dimension' ,type = int, help = 'spatial dimension')
+parser.add_argument('-s','--Size', type = int, help = 'system size')
+
+
+parser.add_argument('-FL', '--Flip', type = int, help = 'Number of spin flips per metropolis sweep')
+parser.add_argument('-SW','--sweep', type = int, help = 'Number of metropolis sweeps per step')
+parser.add_argument('-ST','--steps', type = float, help = 'Number of steps per measurement')
+parser.add_argument('-ME', '--Measure' , type = int, help = 'Number of measurements')
+parser.add_argument('-T','--temp', type = float, help = 'Temperature')
+parser.add_argument('-u', '--ChemPotential', type = float, help = 'Chemical potential')
+parser.add_argument('-Imp', '--Impurities', type = int, help = 'Number of impurities')
+parser.add_argument('-sp', '--Spacing', type = int, help = 'Impurities spacing')
+parser.add_argument('-LV', '--Level', type = float, help = 'Impurity Level')
+
+
+
+args = parser.parse_args()
+
+
+J = args.Coupling
+D = args.Dimension # spatial dimension
+L = args.Size # system size
+M = L**D #Matrix size
+MU = args.ChemPotential
+Imp = args.Impurities
+Spacing = args.Spacing
+sweeps = args.sweep #Number of spin flips per metropolis sweep
+steps = args.steps #Number of Sweeps per recorded temperature
+steps = int(steps)
+measure = args.Measure
+ImpLevel = args.Level
+
+temp = args.temp
+
+Beta = 1/temp
+
+
+with open(r'MCdata.txt', 'w') as f:
+    
+    f.write(str(temp))
+    f.close()
+def get_kin_cubic(Ls,pbc=True):
+	D = len(Ls)
+	N = np.prod(Ls)
+
+	i = np.arange(N)
+
+	H = sp.csr_matrix((N,N),dtype=np.float64)
+
+	for d in range(D):
+		A = np.prod(Ls[:d]).astype(np.int)
+
+		# get d-th coordinate from `i`
+		c = (i//A)%Ls[d]
+
+		if pbc:
+			row = i 
+			# set c -> (c+1)%Ls[d] in `row`,
+			# the term: -c*A, sets c=0 in `row`
+			# the term: ((c+1)%Ls[d])*A sets c=(c+1)%Ls[d] in `row`
+			col = row + ((c+1)%Ls[d] - c)*A 
+		else:
+			m = (c+1) < Ls[d] # get which sites have c+1 < Ls[d]
+
+			# row only contains sites that are not on the edge of the system
+			row = i[m]
+			# set c -> (c+1) in `i`
+			# because c+1 < Ls[d] then (c+1)%Ls[d] = c+1
+			# as such, (c+1-c)*A = 1*A = A
+			col = row + A 
+
+
+		# include matrix elements for row,col and col,row 
+		data = -np.ones_like(col)
+		T = sp.csr_matrix((data,(row,col)),shape=(N,N))
+		H += T + T.transpose()
+
+	return H
+
+ImpurityMatrix = np.zeros((128,128))
+ImpurityMatrix[0,0] = -2.5
+SparseImpMatrix = sp.csr_matrix(ImpurityMatrix)
+
+
+def get_H_SF(Hkin,S,J):
+
+    N = Hkin.shape[0]
+     ####
+
+    
+    Sp = -J*0.5*(S[:,0] + 1j*S[:,1])
+    Sz = -J*0.5*S[:,2]
+   
+
+    B  = sp.dia_matrix((Sp.reshape(1,-1),[0]),shape=Hkin.shape)
+    Sz = sp.dia_matrix((Sz.reshape(1,-1),[0]),shape=Hkin.shape)
+
+    Aup = Hkin + Sz
+    Adn = Hkin - Sz
+
+    H_SF = sp.bmat([[Aup,B.conj()],[B,Adn]])
+    
+    H_SF += SparseImpMatrix
+
+    return H_SF
+
+
+# couplings
+
+def getIndex(x,y,L):
+    
+    return y*L + x
+
+
+# get kinetic term 
+Hk_pbc = get_kin_cubic(D*[L],pbc=True)
+ZeroKin = np.zeros((M,M))
+ChaosDiag = np.zeros(M)
+Location = 0
+coordinate = (0,0)
+
+xcord, ycord = coordinate
+
+if Imp > 0:
+    ChaosDiag[Location] = -ImpLevel
+    
+if Imp > 1:
+    Spacing = getIndex(xcord,ycord, 6)
+    ChaosDiag[(Location + Spacing)%36] = -ImpLevel
+
+#Add the chaos term
+
+#for i in range(L**D):
+    #Hk_pbc[i,i] = ChaosDiag[i]
+
+#print(Hk_pbc)
+
+
+
+
+
+# get spin-fermion hamiltonian
+#H_SF = get_H_SF(Hk_pbc,S,J=J)
+#print(S)
+#print(H_SF)
+
+ChemPotential = MU
+
+
+FreeEnergies = np.zeros(measure)
+
+def sweep( Hk_pbc, currentmatrix, Beta, sweeps):
+    H_SF = get_H_SF(Hk_pbc, currentmatrix, J=J)
+    e,v = np.linalg.eigh(H_SF.toarray())   
+    HeisEnergy = getHeisenberg(currentmatrix, -0.1, L)
+    
+    
+    CurrentArray = np.logaddexp(0, -Beta*(e - ChemPotential))
+    CurrentFreeEnergy = (-np.divide(1,Beta))*np.sum(CurrentArray)  + HeisEnergy
+    for i in range(sweeps):            #Metropolis sweep
+        
+        randy = np.random.randint(0,M)
+        trialmatrix = copy.copy(currentmatrix)
+        """deltaspinx = np.random.uniform(-1,1)         #Change in angle of spin
+        deltaspiny = np.random.uniform(-1,1)         #Change in angle of spin
+        deltaspinz = np.random.uniform(-1,1)         #Change in angle of spin
+        
+        
+        initspinx = currentmatrix[[0,randy] ]            #Pick out random element of S matrix
+        initspiny = currentmatrix[[1,randy] ]            #Pick out random element of S matrix
+        initspinz = currentmatrix[[2,randy] ]            #Pick out random element of S matrix
+        
+        trialspinx = (initspinx + deltaspinx)%1                #Get trial spin
+        trialspiny = (initspiny + deltaspiny)%1                #Get trial spin
+        #trialspinz = (initspinz + deltaspinz)%1                #Get trial spin
+        
+        found = False
+        while found == False:
+            Spin = np.random.uniform(-1,1,size=3)
+            
+            if np.linalg.norm(Spin) <= 1:
+                found = True
+        SpinLength = np.linalg.norm(Spin)
+        
+        Spin[0] /= np.sqrt(SpinLength)
+        Spin[1] /= np.sqrt(SpinLength)
+        Spin[2] /= np.sqrt(SpinLength)
+        """
+        Spin = np.random.normal(0,1,size=3)
+        Spin = np.divide(Spin,np.linalg.norm(Spin))
+        trialmatrix[randy,0] = Spin[0]              #Get trial matrix by changing element of S matrix
+        trialmatrix[randy,1] = Spin[1]              #Get trial matrix by changing element of S matrix
+        trialmatrix[randy,2] = Spin[2]              #Get trial matrix by changing element of S matrix
+        TrialH_SF = get_H_SF(Hk_pbc,trialmatrix,J=J)
+        
+        TrialEigenvals, TrialDiag = np.linalg.eigh(TrialH_SF.toarray())     #Get Eigenvals of Trial matrix
+                             #Get Eigenvals of Current matrix
+        TrialHeisEnergy = getHeisenberg(trialmatrix, -0.1, L)
+        
+        
+        
+        
+        TrialArray = np.logaddexp(0, (((-Beta*(TrialEigenvals - ChemPotential)))))
+        TrialFreeEnergy = (-1/Beta)*np.sum(TrialArray) + TrialHeisEnergy                              #Get the Trial Free Energy and Energy
+        #TrialEnergy = np.sum(np.multiply((1/(np.exp(TrialEigenvals*Beta)+1)),TrialEigenvals))
+        EnergyDiff = Decimal(TrialFreeEnergy) - Decimal(CurrentFreeEnergy)
+        #EnergyDiff = TrialFreeEnergy - CurrentFreeEnergy
+        EnergyDiff = float(EnergyDiff)
+        
+        if TrialFreeEnergy <= CurrentFreeEnergy or np.random.uniform(0.0,1.0) < np.exp(-Beta*(EnergyDiff)):                                 #Perform the random walk
+
+            H_SF = copy.copy(TrialH_SF)
+            currentmatrix = copy.copy(trialmatrix)
+            CurrentFreeEnergy = copy.copy(TrialFreeEnergy)
+            
+
+    
+    return currentmatrix, CurrentFreeEnergy
+
+def load(H_SF, currentmatrix, Beta):
+    for i in range(100):
+        H_SF = sweep(H_SF, currentmatrix, Beta)
+                
+def getEnergy(H_SF, Beta):
+    e,v = np.linalg.eigh(H_SF.toarray()) 
+    return np.sum(np.multiply((1/(np.exp(e*Beta)+1)),e))  
+
+def getNumber(H_SF, Beta):
+    number = 0
+    e,v = np.linalg.eigh(H_SF.toarray())
+    
+    for i in e:
+        if i <= ChemPotential:
+            number+=1
+    
+    return number #np.sum(1/(np.exp((e-ChemPotential)*Beta)))
+       
+
+def getStaggeredMag(SpinMatrix):
+    x = currentmatrix[:,0]
+    y = currentmatrix[:,1]
+    z = currentmatrix[:,2]
+    
+    xpos = x[0:L-1:2]
+    xneg = x[1:L-1:2]
+    
+    ypos = y[0:L-1:2]
+    yneg = y[1:L-1:2]
+    
+    zpos = z[0:L-1:2]
+    zneg = z[1:L-1:2]
+    
+    xmag = np.sum(xpos) - np.sum(xneg)
+    ymag = np.sum(ypos) - np.sum(yneg)
+    zmag = np.sum(zpos) - np.sum(zneg)
+    
+    StaggMag = [xmag,ymag,zmag]
+    TotalStagMag = (1/L)*np.linalg.norm(StaggMag)
+    
+    return(TotalStagMag, StaggMag)
+
+def getFermiDirac(e, Beta):
+    
+    return np.divide(1,(np.exp(((e-ChemPotential)*Beta)+1)))
+
+def getEnergySquare(H_SF,Beta):
+    e,v = np.linalg.eigh(H_SF.toarray()) 
+    EnergySq = getEnergy(H_SF,Beta)**2 + np.sum((((e-ChemPotential)**2)*getFermiDirac(e,Beta)*( 1 - getFermiDirac(e,Beta))))
+    return EnergySq          
+
+def getHeatCapacity(H_SF, Beta):
+    
+    e,v = np.linalg.eigh(H_SF.toarray()) 
+    
+    return (np.sum((np.multiply((1/(np.exp(e*Beta)+1)),e))))**2   + np.sum((((e-ChemPotential)**2)*np.divide(1,(np.exp(e*Beta)+1))*( 1 - np.divide(1,(np.exp(e*Beta)+1)))))
+    
+
+def getEnergyEigenvals(H_SF, Beta):
+    e,v = np.linalg.eigh(H_SF.toarray())
+    return e        
+
+def getHeisenberg(S, J, length):
+    
+  
+    HeisenArray = []
+    for i in range(length**3):
+        currentvector = S[i]
+        floor = i//(length**2)
+        lengthindex = i%(length**2)
+        row = lengthindex//length
+        column = lengthindex%length
+        
+        rightvectorcoord = (row, column +1, floor)
+        upvectorcoord = (row+1 , column, floor)
+        northvectorcoord = (row, column, floor+1)
+        if row >= length-1:
+            upvectorcoord = (0, column, floor)
+            
+        if column >= length - 1:
+            rightvectorcoord = (row, 0, floor)
+        
+        if floor >= length - 1:
+            northvectorcoord = (row, column, 0)
+    
+        
+        rightvectorindex = rightvectorcoord[0]*length + rightvectorcoord[1] + rightvectorcoord[2]*length**2
+        upvectorindex = upvectorcoord[0]*length + upvectorcoord[1] + upvectorcoord[2]*length**2
+        northvectorindex = northvectorcoord[0]*length + northvectorcoord[1] + northvectorcoord[2]*length**2
+        
+        
+       
+        
+        rightvector = S[rightvectorindex]
+        upvector = S[upvectorindex]
+        northvector = S[northvectorindex]
+        
+        CurrentHeisenEnergy = J*(np.dot(currentvector,rightvector) + np.dot(currentvector,upvector) + np.dot(currentvector, northvector))
+        
+        HeisenArray.append(CurrentHeisenEnergy)
+        
+    HeisenEnergy = np.sum(HeisenArray)        
+    
+    return HeisenEnergy
+
+def getMag(SpinMatrix):
+    x = SpinMatrix[:,0]
+    y = SpinMatrix[:,1]
+    z = SpinMatrix[:,2]
+    
+    xmag = np.sum(x)
+    ymag = np.sum(y)
+    zmag = np.sum(z)
+    Mag = [xmag,ymag,zmag]
+    
+    TotalMag = (1/M)*np.linalg.norm(Mag)
+    
+    return TotalMag
+                                     
+testHSF = 0
+with open(r'MCdata.txt' + "_" + str(L) + "_" + str(temp) + "_" + str(sweeps) + "_" + str(steps) + "_" + str(ChemPotential), 'w') as f:
+    # generate random classical spins
+    S = np.random.normal(0,1,size=(L**D,3))
+    S = (S.T/np.linalg.norm(S,axis=1)).T
+    currentmatrix = copy.copy(S)
+    HeisenEnergy = getHeisenberg(S, -0.1, L)
+    #H_SF, currentmatrix = load(H_SF, currentmatrix, Beta)
+    for h in range(measure):
+        ChaosDiag = np.zeros(M)
+        coordinates = np.random.randint(0,63 ,size = 12)
+        if Imp > 0:
+            ChaosDiag[coordinates[0]] = -ImpLevel
+            
+        if Imp > 1:
+            ChaosDiag[coordinates[1]] = -ImpLevel
+            
+        if Imp > 2:
+            ChaosDiag[coordinates[2]] = -ImpLevel
+
+        if Imp > 3:
+            ChaosDiag[coordinates[3]] = -ImpLevel
+        if Imp > 4:
+            ChaosDiag[coordinates[4]] = -ImpLevel
+        if Imp > 5:
+            ChaosDiag[coordinates[5]] = -ImpLevel
+        if Imp > 6:
+            ChaosDiag[coordinates[6]] = -ImpLevel
+        if Imp > 7:
+            ChaosDiag[coordinates[7]] = -ImpLevel
+
+
+        
+        for i in range(L**D):
+            Hk_pbc[i,i] = ChaosDiag[i]
+
+        for k in range(steps):
+            
+            
+            currentmatrix, CurrentFreeEnergy = sweep(Hk_pbc, currentmatrix, Beta, sweeps)    
+     
+        if h > 0:
+            
+            H_SF = get_H_SF(Hk_pbc, currentmatrix, J=J)
+            FreeEnergies[h] = CurrentFreeEnergy
+            Energy = getEnergy(H_SF,Beta)
+            Number = getNumber(H_SF,Beta)
+            Energy = round(Energy, 6)
+            
+            #TotalStagMag, StaggMag = getStaggeredMag(currentmatrix)
+            Magnetization  = getMag(currentmatrix)
+           # StaggeredMag[0] = round(StaggeredMag[0], 6)
+           # StaggeredMag[1] = round(StaggeredMag[1], 6)
+           # StaggeredMag[2] = round(StaggeredMag[2], 6)
+    
+            
+            #EnergySquare = getEnergySquare(H_SF, Beta)
+            #EnergySquare = EnergySquare[0]
+            #EnergySquare = round(EnergySquare, 8)
+            
+            #HeatCapacity = getHeatCapacity(H_SF, Beta)
+            #HeisEnergy = getHeisenberg(currentmatrix,-0.1, L)
+            
+            EnergyEigs = getEnergyEigenvals(H_SF, Beta)
+            #EnergyEigs += HeisEnergy
+            Number = getNumber(H_SF,Beta)
+            testHSF = H_SF
+            f.write('{:<12} {:<12}'.format(temp, Magnetization))
+            f.write("\n")
+
+           
+                                
+            #for Eig in EnergyEigs:
+                #EigString = str(Eig)
+                #f.write('{:<12} {:<12}'.format(EigString, Magnetization, Number))
+                #f.write(str(EnergySquare) + " ")
+                #f.write("\n")
+    
+        
+    
+
+    
+    
+    
+    
+    
+    
+    f.close()
+testHSF = get_H_SF(Hk_pbc, currentmatrix, J=J)    
